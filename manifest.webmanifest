@@ -1,0 +1,21 @@
+{
+  "id": "./",
+  "name": "文件掃描",
+  "short_name": "文件掃描",
+  "description": "拍攝、拉正並整理成 PDF 的文件掃描工具。",
+  "lang": "zh-Hant",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f5f6f8",
+  "theme_color": "#f5f6f8",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
