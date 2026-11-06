@@ -235,6 +235,49 @@ function orderPts(a) {
   const first=ordered.reduce((best,p,index)=>p[0]+p[1]<ordered[best][0]+ordered[best][1]?index:best,0);
   return ordered.slice(first).concat(ordered.slice(0,first));
 }
+// 前景分割找文件：假設文件在畫面中央、背景（桌面）佔外圍。GrabCut 以內縮矩形初始化，
+// 不依賴邊緣線是否連續，所以文件內有圖案/文字、或紙色與桌面接近時也能抓到整張。
+function grabCutQuad(rgba) {
+  const tmps = [];
+  const mk = (x) => { x = x || new cv.Mat(); tmps.push(x); return x; };
+  try {
+    const k = Math.min(1, 320 / Math.max(rgba.cols, rgba.rows));
+    const w = Math.max(16, Math.round(rgba.cols * k)), h = Math.max(16, Math.round(rgba.rows * k));
+    const rgb = mk(); cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+    const small = mk(); cv.resize(rgb, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+    const mask = mk(new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(0)));
+    const bgd = mk(), fgd = mk();
+    const ix = Math.round(w * 0.03), iy = Math.round(h * 0.03);
+    cv.grabCut(small, mask, new cv.Rect(ix, iy, w - 2 * ix, h - 2 * iy), bgd, fgd, 4, cv.GC_INIT_WITH_RECT);
+    const fg = mk(new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(0)));
+    let count = 0;
+    for (let i = 0; i < mask.data.length; i++) { const v = mask.data[i]; if (v === 1 || v === 3) { fg.data[i] = 255; count++; } }
+    const ratio = count / (w * h);
+    if (ratio < 0.08 || ratio > 0.95) return null;           // 分割失敗（太小或幾乎整張都是前景）
+    const open = mk(cv.Mat.ones(3, 3, cv.CV_8U));
+    cv.morphologyEx(fg, fg, cv.MORPH_OPEN, open);
+    const cs = new cv.MatVector(), hier = mk(); tmps.push({ delete: () => cs.delete() });
+    cv.findContours(fg, cs, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let best = -1, bestA = 0;
+    for (let i = 0; i < cs.size(); i++) { const c = cs.get(i), a = cv.contourArea(c); c.delete(); if (a > bestA) { bestA = a; best = i; } }
+    if (best < 0 || bestA < 0.08 * w * h) return null;
+    const big = cs.get(best), hull = mk(); cv.convexHull(big, hull, false, true); big.delete();
+    const hullA = cv.contourArea(hull), per = cv.arcLength(hull, true);
+    let quad = null;
+    for (let eps = 0.01; eps < 0.12; eps += 0.005) {            // 逐步放寬，找可近似成 4 點（保留透視）的凸包
+      const ap = new cv.Mat(); cv.approxPolyDP(hull, ap, eps * per, true);
+      const n = ap.rows, a = n === 4 ? cv.contourArea(ap) : 0;
+      if (n === 4 && a >= 0.9 * hullA) quad = [0, 1, 2, 3].map(j => [ap.data32S[j * 2], ap.data32S[j * 2 + 1]]);
+      ap.delete(); if (n <= 4) break;
+    }
+    if (!quad) {                                                // 退而求其次：最小外接旋轉矩形
+      const rr = cv.minAreaRect(hull), pp = cv.RotatedRect.points(rr);
+      quad = pp.map(p => [p.x, p.y]);
+    }
+    return quad.map(p => [p[0] / k, p[1] / k]);                 // 回到輸入圖座標
+  } finally { tmps.forEach(x => x.delete()); }
+}
+
 function detect(autoWarp = false) {
   if (!cvReady || !src) return false;
   status('正在偵測文件邊緣…');
@@ -245,6 +288,9 @@ function detect(autoWarp = false) {
   let found=null,foundArea=0,detectionError=false;
   try {
     m=cv.imread(t); gray=new cv.Mat(); edges=new cv.Mat(); kern=cv.Mat.ones(5,5,cv.CV_8U); cs=new cv.MatVector(); hier=new cv.Mat();
+    let gq=null;
+    try { gq=grabCutQuad(m); } catch(error) { console.warn('GrabCut 偵測失敗，改用邊緣法', error); }
+    if(gq){ found=gq.map(p=>[p[0]/k,p[1]/k]); foundArea=1; } else {   // 主要：前景分割；失敗才走下面的邊緣/顏色備援
     cv.cvtColor(m,gray,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(gray,gray,new cv.Size(5,5),0);
     cv.Canny(gray,edges,50,150); cv.morphologyEx(edges,edges,cv.MORPH_CLOSE,kern);
     cv.findContours(edges,cs,hier,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);
@@ -285,6 +331,7 @@ function detect(autoWarp = false) {
           foundArea=area;found=quad.map(point=>[point[0]/k,point[1]/k]);
         }
       }finally{ap.delete();c.delete();}
+    }
     }
   } catch(error) {
     detectionError=true;

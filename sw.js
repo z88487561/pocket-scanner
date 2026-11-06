@@ -1,4 +1,4 @@
-const CACHE_NAME = 'document-scanner-v3';
+const CACHE_NAME = 'document-scanner-v4';
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 // 跨網域靜態資源白名單：只快取這些網址（cache-first），其他跨網域請求一律不攔截
 const CDN_ASSETS = ['https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.1/dist/opencv.js'];
