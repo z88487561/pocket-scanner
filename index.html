@@ -302,6 +302,7 @@ function refineQuadByColor(rgba, quad0) {
     quad = r.quad;
     if (done) break;
   }
+  if (ref) { try { quad = extendEdgesByColor(rgba, quad, ref); } catch (error) { console.warn('邊緣外推失敗，沿用修正結果', error); } }
   return quad;
 }
 function polyArea(p) { let s = 0; for (let i = 0; i < p.length; i++) { const q = p[(i + 1) % p.length]; s += p[i][0] * q[1] - q[0] * p[i][1]; } return Math.abs(s) / 2; }
@@ -374,6 +375,62 @@ function refineOnce(rgba, q0, ref0) {
     }
     if (!res) return null;                                  // 無法近似成四邊形（頁面彎曲/外溢）→ 不採用，維持原判斷
     return { quad: res.map(p => [p[0] / k, p[1] / k]), ref: { med, thr } };
+  } finally { tmps.forEach(x => x.delete()); }
+}
+
+// 邊緣外推：如果某條邊「切進」紙面（外側一小條仍是同色的紙），就把該邊兩端各自往外推，
+// 直到外側變成不同顏色（另一張紙、桌面）或超出畫面。用來避免靠近紙緣的文字被裁掉；不需要 OCR。
+function extendEdgesByColor(rgba, quad0, ref) {
+  const tmps = [];
+  const keep = x => { tmps.push(x); return x; };
+  try {
+    const k = Math.min(1, 400 / Math.max(rgba.cols, rgba.rows));
+    const w = Math.max(16, Math.round(rgba.cols * k)), h = Math.max(16, Math.round(rgba.rows * k));
+    const rgb = keep(new cv.Mat()); cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+    const small = keep(new cv.Mat()); cv.resize(rgb, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+    cv.GaussianBlur(small, small, new cv.Size(0, 0), 1.2);
+    const lab = keep(new cv.Mat()); cv.cvtColor(small, lab, cv.COLOR_RGB2Lab);
+    const L = lab.data, thr = ref.thr * 2.0;                // 外推時判斷較寬鬆（紙緣常有陰影、光線漸層）
+    const paper = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const dl = (L[i*3] - ref.med[0]) * 0.15, da = L[i*3+1] - ref.med[1], db = L[i*3+2] - ref.med[2];
+      if (dl*dl + da*da + db*db < thr * thr) paper[i] = 1;
+    }
+    let q = quad0.map(p => [p[0] * k, p[1] * k]);
+    let s2 = 0; for (let i = 0; i < 4; i++) { const n = q[(i+1)%4]; s2 += q[i][0] * n[1] - q[i][1] * n[0]; }
+    if (s2 < 0) q = q.reverse();
+    const dmax = Math.round(Math.min(w, h) * 0.05), N = 24;
+    const push = (a, b, n, t0, t1) => {
+      let best = 0, miss = 0;
+      for (let d = 1; d <= dmax; d++) {
+        let inb = 0, hit = 0;
+        for (let s = 0; s < N; s++) {
+          const t = t0 + (t1 - t0) * s / (N - 1), x = Math.round(a[0] + (b[0] - a[0]) * t + n[0] * d), y = Math.round(a[1] + (b[1] - a[1]) * t + n[1] * d);
+          if (x >= 0 && x < w && y >= 0 && y < h) { inb++; hit += paper[y * w + x]; }
+        }
+        if (inb < N / 3) break;                             // 超出畫面：看不到，不再外推
+        if (hit / inb >= 0.4) { best = d; miss = 0; } else if (++miss >= 2) break;
+      }
+      return best;
+    };
+    const lines = [];
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i+1)%4], dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+      if (len < 1e-6) return quad0;
+      const n = [dy / len, -dx / len];
+      const da = push(a, b, n, 0.05, 0.45), db = push(a, b, n, 0.55, 0.95);   // 兩端各自外推，邊可以微微旋轉貼齊
+      lines.push([[a[0] + n[0] * da, a[1] + n[1] * da], [b[0] + n[0] * db, b[1] + n[1] * db]]);
+    }
+    const out = [];
+    for (let i = 0; i < 4; i++) {
+      const [p1, p2] = lines[(i + 3) % 4], [p3, p4] = lines[i];
+      const d1 = [p2[0] - p1[0], p2[1] - p1[1]], d2 = [p4[0] - p3[0], p4[1] - p3[1]], den = d1[0] * d2[1] - d1[1] * d2[0];
+      if (Math.abs(den) < 1e-6) return quad0;
+      const t = ((p3[0] - p1[0]) * d2[1] - (p3[1] - p1[1]) * d2[0]) / den;
+      out.push([p1[0] + d1[0] * t, p1[1] + d1[1] * t]);
+    }
+    if (polyArea(out) > 1.25 * polyArea(q)) return quad0;   // 保護：放大過頭就放棄
+    return out.map(p => [p[0] / k, p[1] / k]);
   } finally { tmps.forEach(x => x.delete()); }
 }
 
