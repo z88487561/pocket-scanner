@@ -287,6 +287,96 @@ function grabCutQuad(rgba) {
   } finally { tmps.forEach(x => x.delete()); }
 }
 
+// 以「第一次四角範圍內的主要底色」重新評估四角：在附近找同色區域、補洞、再取四角。
+// 只有在範圍內大多是單一底色（估價單、白紙…）時才採用；傳單、多色封面等維持原判斷。
+function refineQuadByColor(rgba, quad0) {
+  let quad = quad0, ref = null;
+  const a0 = polyArea(quad0);
+  for (let pass = 0; pass < 3; pass++) {                 // 小範圍最多分 3 次長大，面積變化 < 2% 就停
+    const r = refineOnce(rgba, quad, ref);
+    if (!r) break;
+    ref = r.ref;                                         // 參考底色只在第一次（用原始四角內部）決定，之後沿用，避免越長越偏向桌面顏色
+    const a1 = polyArea(r.quad), growth = a1 / a0;
+    if (growth < 0.7 || growth > 1.8) break;             // 相對原始四角變動過大 → 停止
+    const done = Math.abs(a1 - polyArea(quad)) / polyArea(quad) < 0.02;
+    quad = r.quad;
+    if (done) break;
+  }
+  return quad;
+}
+function polyArea(p) { let s = 0; for (let i = 0; i < p.length; i++) { const q = p[(i + 1) % p.length]; s += p[i][0] * q[1] - q[0] * p[i][1]; } return Math.abs(s) / 2; }
+
+function refineOnce(rgba, q0, ref0) {
+  const tmps = [];
+  const keep = x => { tmps.push(x); return x; };
+  const mk = () => keep(new cv.Mat());
+  const odd = v => (Math.max(3, Math.round(v)) | 1);
+  try {
+    const k = Math.min(1, 400 / Math.max(rgba.cols, rgba.rows));
+    const w = Math.max(16, Math.round(rgba.cols * k)), h = Math.max(16, Math.round(rgba.rows * k)), side = Math.min(w, h);
+    const rgb = mk(); cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+    const small = mk(); cv.resize(rgb, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+    cv.GaussianBlur(small, small, new cv.Size(0, 0), 1.2);
+    const lab = mk(); cv.cvtColor(small, lab, cv.COLOR_RGB2Lab);
+    // 第一次四角 → 遮罩
+    const quad = keep(cv.Mat.zeros(h, w, cv.CV_8UC1));
+    const pts = keep(cv.matFromArray(q0.length, 1, cv.CV_32SC2, q0.flatMap(p => [Math.round(p[0] * k), Math.round(p[1] * k)])));
+    cv.fillConvexPoly(quad, pts, new cv.Scalar(255));
+    const qa = cv.countNonZero(quad);
+    if (qa < 400) return null;
+    const big = keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(side * 0.2), odd(side * 0.2))));
+    const inner = mk(); cv.erode(quad, inner, big);
+    const useInner = cv.countNonZero(inner) >= 200 ? inner : quad;
+    const L = lab.data, n = w * h;
+    let med, thr, purity = 1;
+    const dist = i => { const dl = (L[i*3] - med[0]) * 0.25, da = L[i*3+1] - med[1], db = L[i*3+2] - med[2]; return Math.sqrt(dl*dl + da*da + db*db); };
+    if (ref0) { med = ref0.med; thr = ref0.thr; }
+    else {
+      // 內部像素的中位數顏色（直方圖法）
+      const cnt = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+      let m = 0;
+      for (let i = 0; i < n; i++) if (useInner.data[i]) { m++; cnt[0][L[i*3]]++; cnt[1][L[i*3+1]]++; cnt[2][L[i*3+2]]++; }
+      med = cnt.map(c => { let s = 0; for (let v = 0; v < 256; v++) { s += c[v]; if (s >= m / 2) return v; } return 128; });
+      const din = new Float32Array(m); let j = 0;
+      for (let i = 0; i < n; i++) if (useInner.data[i]) din[j++] = dist(i);
+      const sorted = Float32Array.from(din).sort();
+      thr = Math.min(24, Math.max(8, 2.0 * sorted[m >> 1] + 3));
+      let ok = 0; for (let i = 0; i < m; i++) if (din[i] < thr) ok++;
+      purity = ok / m;
+      if (thr > 15 || purity < 0.72) return null;          // 內部顏色離散（多色/漸層/深淺不一）→ 不是單一底色，不調整
+    }
+    // 在第一次結果附近找同色像素
+    const near = mk(); cv.dilate(quad, near, big);
+    const mask = keep(cv.Mat.zeros(h, w, cv.CV_8UC1));
+    for (let i = 0; i < n; i++) if (near.data[i] && dist(i) < thr) mask.data[i] = 255;
+    const kc = keep(cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(odd(side * 0.035), odd(side * 0.035))));
+    const ko = keep(cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(odd(side * 0.04), odd(side * 0.04))));
+    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kc);       // 連起被印刷線/手寫切開的紙面
+    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, ko);        // 去掉細長外溢（疊在底下的複寫聯邊緣）
+    const cs = new cv.MatVector(); keep({ delete: () => cs.delete() });
+    const hier = mk(); cv.findContours(mask, cs, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let bi = -1, ba = 0;
+    for (let i = 0; i < cs.size(); i++) { const c = cs.get(i), a = cv.contourArea(c); c.delete(); if (a > ba) { ba = a; bi = i; } }
+    if (bi < 0) return null;
+    const filled = keep(cv.Mat.zeros(h, w, cv.CV_8UC1));
+    const bc = cs.get(bi), one = keep(new cv.MatVector()); one.push_back(bc);
+    cv.drawContours(filled, one, 0, new cv.Scalar(255), -1);
+    const fa = cv.countNonZero(filled), ratio = fa / qa;
+    if (!(ratio > 0.5 && ratio < 1.7) || ratio < (ref0 || purity >= 0.85 ? 0.75 : 0.92)) { bc.delete(); return null; }   // 變動過大 → 不採用
+    const hull = mk(); cv.convexHull(bc, hull, false, true); bc.delete();
+    const hullA = cv.contourArea(hull), per = cv.arcLength(hull, true);
+    let res = null;
+    for (let eps = 0.01; eps < 0.12; eps += 0.005) {
+      const ap = new cv.Mat(); cv.approxPolyDP(hull, ap, eps * per, true);
+      const rows = ap.rows, a = rows === 4 ? cv.contourArea(ap) : 0;
+      if (rows === 4 && a >= 0.9 * hullA) res = [0, 1, 2, 3].map(t => [ap.data32S[t*2], ap.data32S[t*2+1]]);
+      ap.delete(); if (rows <= 4) break;
+    }
+    if (!res) return null;                                  // 無法近似成四邊形（頁面彎曲/外溢）→ 不採用，維持原判斷
+    return { quad: res.map(p => [p[0] / k, p[1] / k]), ref: { med, thr } };
+  } finally { tmps.forEach(x => x.delete()); }
+}
+
 function detect(autoWarp = false) {
   if (!cvReady || !src) return false;
   status('正在偵測文件邊緣…');
@@ -299,6 +389,7 @@ function detect(autoWarp = false) {
     m=cv.imread(t); gray=new cv.Mat(); edges=new cv.Mat(); kern=cv.Mat.ones(5,5,cv.CV_8U); cs=new cv.MatVector(); hier=new cv.Mat();
     let gq=null;
     try { gq=grabCutQuad(m); } catch(error) { console.warn('GrabCut 偵測失敗，改用邊緣法', error); }
+    if(gq){ try { gq=refineQuadByColor(m,gq); } catch(error) { console.warn('底色修正失敗，沿用 GrabCut 結果', error); } }   // 用範圍內的主要底色再評估四角
     if(gq){ found=gq.map(p=>[p[0]/k,p[1]/k]); foundArea=1; } else {   // 主要：前景分割；失敗才走下面的邊緣/顏色備援
     cv.cvtColor(m,gray,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(gray,gray,new cv.Size(5,5),0);
     cv.Canny(gray,edges,50,150); cv.morphologyEx(edges,edges,cv.MORPH_CLOSE,kern);
