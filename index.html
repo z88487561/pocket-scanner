@@ -106,10 +106,15 @@ canvas{max-width:100%;height:auto;display:block}
       <button data-f="orig" class="flt" type="button">原色</button>
       <button data-f="enh" class="flt" type="button">增強</button>
       <button data-f="gray" class="flt" type="button">灰階</button>
-      <button data-f="scan" class="flt on" type="button" title="校正紙面亮度與陰影，白底黑字，保留灰階層次">掃描</button>
+      <button data-f="scan" class="flt" type="button" title="校正紙面亮度與陰影，白底黑字，保留灰階層次">掃描</button>
+      <button data-f="form" class="flt" type="button" title="有固定印刷色的表單（估價單等）：淡化紅/橙/黃/綠印刷色，突顯藍/黑手寫">表單</button>
       <button data-f="bw" class="flt" type="button" title="先校正紙面亮度，再依局部對比轉成黑白">黑白</button>
       <label id="scanLevelWrap" style="display:inline-flex;align-items:center;gap:6px;font-size:13px">濃淡
         <input id="scanLevel" type="range" min="90" max="160" value="120" style="width:110px"></label>
+      <span id="formWrap" style="display:none;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px">
+        <label style="display:inline-flex;align-items:center;gap:6px" title="越高，紅/橙/黃/綠色的印刷線條與底色越淡">表單色淡化 <input id="formFade" type="range" min="0" max="100" value="90" style="width:100px"></label>
+        <label style="display:inline-flex;align-items:center;gap:6px" title="越高，黑色印刷字越淡，藍/藍紫色手寫越突出">筆跡強調 <input id="formEmph" type="range" min="0" max="100" value="0" style="width:100px"></label>
+      </span>
       <button id="btnRot" type="button">旋轉 90°</button>
       <button id="btnSave" type="button">下載 JPG</button>
     </div>
@@ -123,7 +128,11 @@ canvas{max-width:100%;height:auto;display:block}
 const $ = id => document.getElementById(id);
 const status = (text, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
 let cvReady = false, src = null, pts = [], S = 1, drag = -1;
-let warped = null, filter = 'scan', rot = 0, pages = [];
+const FILTERS = ['orig','enh','gray','scan','form','bw'];
+function pref(key, fallback) { try { const v = localStorage.getItem('docscan.' + key); return v === null ? fallback : v; } catch (error) { return fallback; } }
+function setPref(key, value) { try { localStorage.setItem('docscan.' + key, String(value)); } catch (error) {} }
+function savedFilter() { const f = pref('filter', 'scan'); return FILTERS.includes(f) ? f : 'scan'; }
+let warped = null, filter = savedFilter(), rot = 0, pages = [];
 
 function ready() {
   if (cvReady) return;
@@ -373,7 +382,7 @@ function warp() {
   } finally {
     [m,dst,a,b,M].forEach(value=>{if(value)value.delete();});
   }
-  rot=0;filter='scan';
+  rot=0;filter=savedFilter();
   document.querySelectorAll('.flt').forEach(x=>x.classList.toggle('on',x.dataset.f===filter));
   $('editView').classList.add('hide');$('homeView').classList.add('hide');$('resView').classList.remove('hide');
   render();status(`拉正完成：${w} × ${h} px`);
@@ -381,7 +390,7 @@ function warp() {
 $('btnWarp').addEventListener('click',warp);
 $('btnBack').addEventListener('click',()=>{$('resView').classList.add('hide');$('editView').classList.remove('hide');layout();});
 function returnToPicker(message) {
-  src=null;warped=null;pts=[];rot=0;filter='scan';
+  src=null;warped=null;pts=[];rot=0;filter=savedFilter();
   $('resView').classList.add('hide');$('editView').classList.add('hide');$('homeView').classList.remove('hide');
   if(message)status(message);
 }
@@ -419,9 +428,70 @@ function scanFilter(g, lo) {
   } finally { tmps.forEach(x => x.delete()); }
 }
 
+// 表單濾鏡：針對有固定印刷色（紅/橙/黃/綠/粉紅）的估價單，淡化表單色、保留藍/黑色手寫筆跡
+function formFilter(rgba, lo, fade, emph) {
+  const tmps = [];
+  const keep = x => { tmps.push(x); return x; };
+  const mk = () => keep(new cv.Mat());
+  const sat = (x, a, b) => x <= a ? 0 : x >= b ? 1 : (x - a) / (b - a);
+  let out = null;
+  try {
+    const rgb = mk(); cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+    // 1) 各色頻分別估計紙面背景再相除：紙色（黃/粉紅）變白，印刷色與墨水保留相對顏色
+    const k = Math.min(1, 800 / Math.max(rgb.cols, rgb.rows));
+    const small = mk();
+    cv.resize(rgb, small, new cv.Size(Math.max(1, Math.round(rgb.cols * k)), Math.max(1, Math.round(rgb.rows * k))), 0, 0, cv.INTER_AREA);
+    const ks = Math.max(9, Math.floor(Math.min(small.cols, small.rows) / 22)) | 1;
+    const el = keep(cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(ks, ks)));
+    cv.dilate(small, small, el);
+    cv.medianBlur(small, small, Math.min(ks, 255) | 1);
+    cv.GaussianBlur(small, small, new cv.Size(0, 0), ks / 2);
+    const bg = mk(); cv.resize(small, bg, new cv.Size(rgb.cols, rgb.rows), 0, 0, cv.INTER_LINEAR);
+    const flat = mk(); cv.divide(rgb, bg, flat, 255, cv.CV_8U);
+    // 2) 灰階 = 一般亮度 與 max(R,G) 的混合：紅/橙/黃/綠/粉紅變亮，藍/深藍/黑維持深色
+    const mv = keep(new cv.MatVector()); cv.split(flat, mv);
+    const R = keep(mv.get(0)), G = keep(mv.get(1));
+    const drop = mk(); cv.max(R, G, drop);
+    const luma = mk(); cv.cvtColor(flat, luma, cv.COLOR_RGB2GRAY);
+    const gray = mk(); cv.addWeighted(luma, 1 - fade, drop, fade, 0, gray);
+    // 3) 色階拉開 + 輕微銳化（與「掃描」相同）
+    const hi = lo + 80, arr = new Array(256);
+    for (let i = 0; i < 256; i++) arr[i] = Math.round(255 * Math.pow(sat(i, lo, hi), 1.2));
+    const lut = keep(cv.matFromArray(1, 256, cv.CV_8U, arr));
+    const lev = mk(); cv.LUT(gray, lut, lev);
+    const blur = mk(); cv.GaussianBlur(lev, blur, new cv.Size(0, 0), 1.2);
+    out = new cv.Mat(); cv.addWeighted(lev, 1.6, blur, -0.6, 0, out);
+    // 4) 筆跡強調：藍/藍紫色（原子筆）以外的深色（印刷黑字、黑線）稍微淡化，讓手寫更突出
+    if (emph > 0) {
+      const lab = mk(); cv.cvtColor(flat, lab, cv.COLOR_RGB2Lab);
+      const lv = keep(new cv.MatVector()); cv.split(lab, lv);
+      const A = keep(lv.get(1)), Bc = keep(lv.get(2));
+      cv.GaussianBlur(A, A, new cv.Size(0, 0), 0.8); cv.GaussianBlur(Bc, Bc, new cv.Size(0, 0), 0.8);
+      const ink = keep(new cv.Mat(out.rows, out.cols, cv.CV_8UC1, new cv.Scalar(0)));
+      for (let i = 0; i < ink.data.length; i++) {
+        const a = A.data[i] - 128, b = Bc.data[i] - 128, c2 = a * a + b * b;
+        if (c2 < 144) continue;                                         // 彩度 < 12：中性色，不是藍筆
+        const C = Math.sqrt(c2), hue = Math.atan2(b, a) * 180 / Math.PI;               // 藍~藍紫約 -40°~-130°
+        ink.data[i] = Math.round(255 * sat(C, 12, 20) * sat(-hue, 35, 50) * (1 - sat(-hue, 130, 150)));
+      }
+      cv.dilate(ink, ink, keep(cv.Mat.ones(3, 3, cv.CV_8U)));        // 細筆畫彩度偏低，稍微擴張
+      for (let i = 0; i < out.data.length; i++) {
+        const v = out.data[i];
+        if (v >= 240) continue;                                         // 已是白底，不需處理
+        out.data[i] = v + (255 - v) * 0.5 * emph * (1 - ink.data[i] / 255) * (1 - sat(v, 200, 240));
+      }
+    }
+    return out;
+  } catch (error) {
+    if (out) out.delete();
+    throw error;
+  } finally { tmps.forEach(x => x.delete()); }
+}
+
 function render() {
   if(!warped)return;
-  $('scanLevelWrap').style.display=filter==='scan'?'inline-flex':'none';
+  $('scanLevelWrap').style.display=(filter==='scan'||filter==='form')?'inline-flex':'none';
+  $('formWrap').style.display=filter==='form'?'inline-flex':'none';
   let m,o,g,channels,hsv,rgb;
   try {
     m=cv.imread(warped);o=new cv.Mat();g=new cv.Mat();
@@ -437,6 +507,10 @@ function render() {
     else if(filter==='scan'){
       cv.cvtColor(m,g,cv.COLOR_RGBA2GRAY);
       const s=scanFilter(g,Number($('scanLevel').value)||120);
+      cv.cvtColor(s,o,cv.COLOR_GRAY2RGBA);s.delete();
+    }
+    else if(filter==='form'){
+      const s=formFilter(m,Number($('scanLevel').value)||120,Number($('formFade').value)/100,Number($('formEmph').value)/100);
       cv.cvtColor(s,o,cv.COLOR_GRAY2RGBA);s.delete();
     }
     else if(filter==='gray'){cv.cvtColor(m,g,cv.COLOR_RGBA2GRAY);cv.cvtColor(g,o,cv.COLOR_GRAY2RGBA);}
@@ -461,9 +535,14 @@ function render() {
   }
 }
 document.querySelectorAll('.flt').forEach(button=>button.addEventListener('click',()=>{
-  filter=button.dataset.f;document.querySelectorAll('.flt').forEach(x=>x.classList.toggle('on',x===button));render();
+  filter=button.dataset.f;setPref('filter',filter);document.querySelectorAll('.flt').forEach(x=>x.classList.toggle('on',x===button));render();
 }));
-$('scanLevel').addEventListener('change',render);
+[['scanLevel','level'],['formFade','fade'],['formEmph','emph']].forEach(([id,key])=>{   // 滑桿設定會記住，下一張照片沿用
+  const el=$(id),v=Number(pref(key,el.value));
+  if(v>=Number(el.min)&&v<=Number(el.max))el.value=v;
+  el.addEventListener('change',()=>{setPref(key,el.value);render();});
+});
+document.querySelectorAll('.flt').forEach(x=>x.classList.toggle('on',x.dataset.f===filter));
 $('btnRot').addEventListener('click',()=>{rot=(rot+1)%4;render();});
 function downloadCanvas(canvas,name,type='image/jpeg',onDownloaded) {
   canvas.toBlob(blob=>{
