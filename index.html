@@ -97,6 +97,7 @@ canvas{max-width:100%;height:auto;display:block}
       <div class="section-head"><h2>掃描結果</h2></div>
       <div class="bar">
         <button id="btnBack" type="button">調整四角</button>
+        <button id="btnFull" type="button" title="不裁切、不偵測，直接以整張照片作為掃描範圍（適合幾乎滿版的表單）">整張掃描</button>
         <button id="btnReplaceResult" type="button">重新選照片</button>
         <button id="btnAddPage" type="button">加入 PDF 並掃下一張</button>
         <button id="btnNext" class="pri" type="button">下載 JPG 並掃描下一張</button>
@@ -536,6 +537,14 @@ function warp() {
   render();status(`拉正完成：${w} × ${h} px`);
 }
 $('btnWarp').addEventListener('click',warp);
+// 整張掃描：四角直接設為整張照片的邊界（不留邊、不偵測），適合幾乎滿版的表單
+$('btnFull').addEventListener('click',()=>{
+  if(!src)return;
+  const w=src.width,h=src.height;
+  pts=[[0,0],[w,0],[w,h],[0,h]];
+  warp();
+  status(`整張掃描完成：${w} × ${h} px（可按「調整四角」重新框選）`);
+});
 $('btnBack').addEventListener('click',()=>{$('resView').classList.add('hide');$('editView').classList.remove('hide');layout();});
 function returnToPicker(message) {
   src=null;warped=null;pts=[];rot=0;filter=savedFilter();
